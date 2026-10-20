@@ -533,7 +533,7 @@ impl FormattingOptions {
     /// You may alternatively use [`Formatter::new()`].
     #[unstable(feature = "formatting_options", issue = "118117")]
     pub const fn create_formatter<'a>(self, write: &'a mut (dyn Write + 'a)) -> Formatter<'a> {
-        Formatter { options: self, buf: write }
+        Formatter { options: self, buf: write, pad: None }
     }
 }
 
@@ -562,6 +562,10 @@ pub struct Formatter<'a> {
     options: FormattingOptions,
 
     buf: &'a mut (dyn Write + 'a),
+
+    // The padding levels of pretty `Debug` output that `buf` already applies,
+    // when `buf` is the debug builders' padding adapter.
+    pad: Option<&'a builders::PadLevels>,
 }
 
 impl<'a> Formatter<'a> {
@@ -574,13 +578,13 @@ impl<'a> Formatter<'a> {
     /// You may alternatively use [`FormattingOptions::create_formatter()`].
     #[unstable(feature = "formatting_options", issue = "118117")]
     pub const fn new(write: &'a mut (dyn Write + 'a), options: FormattingOptions) -> Self {
-        Formatter { options, buf: write }
+        Formatter { options, buf: write, pad: None }
     }
 
     /// Creates a new formatter based on this one with given [`FormattingOptions`].
     #[unstable(feature = "formatting_options", issue = "118117")]
     pub const fn with_options<'b>(&'b mut self, options: FormattingOptions) -> Formatter<'b> {
-        Formatter { options, buf: self.buf }
+        Formatter { options, buf: self.buf, pad: self.pad }
     }
 }
 
@@ -915,7 +919,7 @@ impl Debug for Arguments<'_> {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Display for Arguments<'_> {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
-        write(fmt.buf, *self)
+        write_padded(fmt.buf, fmt.pad, *self)
     }
 }
 
@@ -1628,7 +1632,18 @@ pub trait UpperExp: PointeeSized {
 ///
 /// [`write!`]: crate::write!
 #[stable(feature = "rust1", since = "1.0.0")]
+#[inline]
 pub fn write(output: &mut dyn Write, fmt: Arguments<'_>) -> Result {
+    write_padded(output, None, fmt)
+}
+
+/// [`write`] into an `output` that already applies the padding levels `pad`
+/// of pretty `Debug` output, so that the formatters it makes share them.
+fn write_padded(
+    output: &mut dyn Write,
+    pad: Option<&builders::PadLevels>,
+    fmt: Arguments<'_>,
+) -> Result {
     if let Some(s) = fmt.as_str() {
         return output.write_str(s);
     }
@@ -1682,9 +1697,11 @@ pub fn write(output: &mut dyn Write, fmt: Arguments<'_>) -> Result {
 
             // SAFETY: We can assume the template only refers to arguments that exist.
             unsafe {
-                args.add(arg_index)
-                    .as_ref()
-                    .fmt(&mut Formatter::new(output, FormattingOptions::new()))?;
+                args.add(arg_index).as_ref().fmt(&mut Formatter {
+                    options: FormattingOptions::new(),
+                    buf: &mut *output,
+                    pad,
+                })?;
             }
             arg_index += 1;
         } else {
@@ -1732,7 +1749,11 @@ pub fn write(output: &mut dyn Write, fmt: Arguments<'_>) -> Result {
 
             // SAFETY: We can assume the template only refers to arguments that exist.
             unsafe {
-                args.add(arg_index).as_ref().fmt(&mut Formatter::new(output, opt))?;
+                args.add(arg_index).as_ref().fmt(&mut Formatter {
+                    options: opt,
+                    buf: &mut *output,
+                    pad,
+                })?;
             }
             arg_index += 1;
         }
@@ -1761,20 +1782,6 @@ impl PostPadding {
 }
 
 impl<'a> Formatter<'a> {
-    fn wrap_buf<'b, 'c, F>(&'b mut self, wrap: F) -> Formatter<'c>
-    where
-        'b: 'c,
-        F: FnOnce(&'b mut (dyn Write + 'b)) -> &'c mut (dyn Write + 'c),
-    {
-        Formatter {
-            // We want to change this
-            buf: wrap(self.buf),
-
-            // And preserve these
-            options: self.options,
-        }
-    }
-
     // Helper methods used for padding and processing formatting arguments that
     // all formatting traits can use.
 
@@ -2129,7 +2136,7 @@ impl<'a> Formatter<'a> {
         if let Some(s) = fmt.as_statically_known_str() {
             self.buf.write_str(s)
         } else {
-            write(self.buf, fmt)
+            write_padded(self.buf, self.pad, fmt)
         }
     }
 
@@ -2850,7 +2857,7 @@ impl Write for Formatter<'_> {
         if let Some(s) = args.as_statically_known_str() {
             self.buf.write_str(s)
         } else {
-            write(self.buf, args)
+            write_padded(self.buf, self.pad, args)
         }
     }
 }

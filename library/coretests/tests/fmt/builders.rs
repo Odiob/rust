@@ -1057,3 +1057,185 @@ Foo {
         .trim()
     );
 }
+
+mod pretty_padding {
+    use std::fmt::{self, Formatter, Write};
+
+    /// Writes its text with `write_str`.
+    struct Raw(&'static str);
+
+    impl fmt::Debug for Raw {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    /// Writes its text with one `write_char` per character.
+    struct Chars(&'static str);
+
+    impl fmt::Debug for Chars {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            self.0.chars().try_for_each(|c| f.write_char(c))
+        }
+    }
+
+    /// `N { i: .. }` nested `self.0` levels deep around `x`.
+    struct Nest(usize);
+
+    impl fmt::Debug for Nest {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            match self.0 {
+                0 => f.write_str("x"),
+                n => f.debug_struct("N").field("i", &Nest(n - 1)).finish(),
+            }
+        }
+    }
+
+    /// The pretty output of `Nest(depth)`.
+    fn nest_pretty(depth: usize) -> String {
+        if depth == 0 {
+            return "x".to_string();
+        }
+        let mut lines = vec!["N {".to_string()];
+        lines.extend((1..depth).map(|k| format!("{}i: N {{", "    ".repeat(k))));
+        lines.push(format!("{}i: x,", "    ".repeat(depth)));
+        lines.extend((1..depth).rev().map(|k| format!("{}}},", "    ".repeat(k))));
+        lines.push("}".to_string());
+        lines.join("\n")
+    }
+
+    #[test]
+    fn test_deep_nesting() {
+        for depth in [0, 1, 2, 200] {
+            assert_eq!(nest_pretty(depth), format!("{:#?}", Nest(depth)));
+        }
+    }
+
+    #[test]
+    fn test_newlines_in_values() {
+        struct Foo;
+
+        impl fmt::Debug for Foo {
+            fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+                let list: [&dyn fmt::Debug; 2] = [&Raw("a\nb"), &Chars("\nc\n")];
+                fmt.debug_struct("Foo").field("l", &list).finish()
+            }
+        }
+
+        assert_eq!(
+            "Foo {\n    l: [\n        a\n        b,\n        \n        c\n        ,\n    ],\n}",
+            format!("{Foo:#?}")
+        );
+    }
+
+    #[test]
+    fn test_map_keys_with_newlines() {
+        struct Map;
+
+        impl fmt::Debug for Map {
+            fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+                fmt.debug_map()
+                    .entry(&Raw("k1\nk2"), &Raw("v1\nv2"))
+                    .entry(&Raw("k\n"), &Chars("v"))
+                    .finish()
+            }
+        }
+
+        struct Foo;
+
+        impl fmt::Debug for Foo {
+            fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+                fmt.debug_struct("Foo").field("m", &Map).finish()
+            }
+        }
+
+        assert_eq!("{\n    k1\n    k2: v1\n    v2,\n    k\n    : v,\n}", format!("{Map:#?}"));
+        assert_eq!(
+            "Foo {\n    m: {\n        k1\n        k2: v1\n        v2,\n        k\n        : v,\n    },\n}",
+            format!("{Foo:#?}")
+        );
+    }
+
+    #[test]
+    fn test_with_options_inside_pretty() {
+        struct Foo;
+
+        impl fmt::Debug for Foo {
+            fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+                let options = fmt.options();
+                fmt.with_options(options).debug_struct("Foo").field("a", &1).finish()
+            }
+        }
+
+        assert_eq!("[\n    Foo {\n        a: 1,\n    },\n]", format!("{:#?}", [Foo]));
+    }
+
+    #[test]
+    fn test_new_formatter_inside_pretty() {
+        struct Foo;
+
+        impl fmt::Debug for Foo {
+            fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+                let options = fmt.options();
+                fmt::Debug::fmt(&Nest(2), &mut Formatter::new(fmt, options))
+            }
+        }
+
+        assert_eq!(
+            "[\n    N {\n        i: N {\n            i: x,\n        },\n    },\n]",
+            format!("{:#?}", [Foo])
+        );
+    }
+
+    #[test]
+    fn test_write_inside_pretty() {
+        struct Foo;
+
+        impl fmt::Debug for Foo {
+            fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+                write!(fmt, "<{:#?}>", Nest(1))?;
+                fmt::Write::write_fmt(fmt, format_args!("[{:#?}]\n", Nest(1)))?;
+                let value = format_args!("{:#?}|{:?}", Nest(2), Nest(1));
+                fmt.debug_struct("A").field("f", &value).finish()
+            }
+        }
+
+        assert_eq!(
+            "[\n    <N {\n        i: x,\n    }>[N {\n        i: x,\n    }]\n    A {\n        \
+             f: N {\n            i: N {\n                i: x,\n            },\n        }\
+             |N { i: x },\n    },\n]",
+            format!("{:#?}", [Foo])
+        );
+    }
+
+    #[test]
+    fn test_caught_panic_inside_pretty() {
+        struct Boom;
+
+        impl fmt::Debug for Boom {
+            fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+                fmt.write_str("b\n")?;
+                panic!("boom")
+            }
+        }
+
+        struct Foo;
+
+        impl fmt::Debug for Foo {
+            fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fmt.debug_struct("P").field("a", &Boom).finish()
+                }));
+                assert!(caught.is_err());
+                fmt.debug_struct("Q").field("c", &"d\ne").finish()?;
+                fmt.write_str("\nafter")
+            }
+        }
+
+        assert_eq!(
+            "[\n    P {\n        a: b\n    Q {\n        c: \"d\\ne\",\n    }\n    after,\n    \
+             P {\n        a: b\n    Q {\n        c: \"d\\ne\",\n    }\n    after,\n]",
+            format!("{:#?}", [Foo, Foo])
+        );
+    }
+}

@@ -3,9 +3,15 @@
 use crate::cell::Cell;
 use crate::fmt::{self, Debug, Formatter};
 
-struct PadAdapter<'buf, 'state> {
+/// Indents what it writes by four spaces for each level of pretty-printed
+/// nesting it serves.
+///
+/// The outermost builder creates the adapter, and inner builders reach it
+/// through their formatter's `pad` instead of wrapping it again, so each byte
+/// passes through one adapter rather than one per level.
+struct PadAdapter<'buf, 'levels> {
     buf: &'buf mut (dyn fmt::Write + 'buf),
-    state: &'state mut PadAdapterState,
+    levels: &'levels PadLevels,
 }
 
 struct PadAdapterState {
@@ -18,24 +24,124 @@ impl Default for PadAdapterState {
     }
 }
 
-impl<'buf, 'state> PadAdapter<'buf, 'state> {
-    fn wrap<'slot, 'fmt: 'buf + 'slot>(
-        fmt: &'fmt mut fmt::Formatter<'_>,
-        slot: &'slot mut Option<Self>,
-        state: &'state mut PadAdapterState,
-    ) -> fmt::Formatter<'slot> {
-        fmt.wrap_buf(move |buf| slot.insert(PadAdapter { buf, state }))
+/// The `on_newline` flags of the levels of a [`PadAdapter`], as counts.
+///
+/// Writes come only from the innermost level, and each one sets every
+/// level's flag to whether it ended with a newline. So the levels up to
+/// `written` share the flag `tail`, and of the levels entered since the last
+/// write, `raised` were entered with their flag set.
+pub(super) struct PadLevels {
+    depth: Cell<usize>,
+    written: Cell<usize>,
+    tail: Cell<bool>,
+    raised: Cell<usize>,
+}
+
+impl PadLevels {
+    fn new() -> Self {
+        PadLevels {
+            depth: Cell::new(0),
+            written: Cell::new(0),
+            tail: Cell::new(true),
+            raised: Cell::new(0),
+        }
     }
+
+    fn enter(&self, on_newline: bool) {
+        self.depth.set(self.depth.get() + 1);
+        self.raised.set(self.raised.get() + usize::from(on_newline));
+    }
+
+    /// Leaves the innermost level, entered with flag `entered`, and returns
+    /// its flag now.
+    fn leave(&self, entered: bool) -> bool {
+        let depth = self.depth.get();
+        let written = self.written.get();
+        let flag = if depth <= written {
+            self.tail.get()
+        } else {
+            self.raised.set(self.raised.get() - usize::from(entered));
+            entered
+        };
+        self.depth.set(depth - 1);
+        self.written.set(written.min(depth - 1));
+        flag
+    }
+
+    /// The number of levels whose flag is set: what the next piece is
+    /// indented by.
+    fn indentation(&self) -> usize {
+        let written = if self.tail.get() { self.written.get() } else { 0 };
+        written + self.raised.get()
+    }
+
+    fn wrote(&self, ends_with_newline: bool) {
+        self.tail.set(ends_with_newline);
+        self.written.set(self.depth.get());
+        self.raised.set(0);
+    }
+}
+
+/// A level of a [`PadAdapter`], left on drop so that a `Debug` impl that
+/// unwinds leaves the levels as it found them.
+struct PadLevel<'a> {
+    levels: &'a PadLevels,
+    state: &'a mut PadAdapterState,
+    entered: bool,
+}
+
+impl<'a> PadLevel<'a> {
+    fn enter(levels: &'a PadLevels, state: &'a mut PadAdapterState) -> Self {
+        let entered = state.on_newline;
+        levels.enter(entered);
+        PadLevel { levels, state, entered }
+    }
+}
+
+impl Drop for PadLevel<'_> {
+    fn drop(&mut self) {
+        self.state.on_newline = self.levels.leave(self.entered);
+    }
+}
+
+/// Runs `body` with a formatter that indents by one level more than `fmt`;
+/// `state` keeps that level's flag between calls.
+fn padded(
+    fmt: &mut fmt::Formatter<'_>,
+    state: &mut PadAdapterState,
+    body: &mut dyn FnMut(&mut fmt::Formatter<'_>) -> fmt::Result,
+) -> fmt::Result {
+    let options = fmt.options;
+    match fmt.pad {
+        Some(levels) => {
+            let _level = PadLevel::enter(levels, state);
+            body(&mut fmt::Formatter { options, buf: &mut *fmt.buf, pad: Some(levels) })
+        }
+        None => {
+            let levels = PadLevels::new();
+            let _level = PadLevel::enter(&levels, state);
+            let mut adapter = PadAdapter { buf: &mut *fmt.buf, levels: &levels };
+            body(&mut fmt::Formatter { options, buf: &mut adapter, pad: Some(&levels) })
+        }
+    }
+}
+
+fn write_indentation(buf: &mut dyn fmt::Write, levels: usize) -> fmt::Result {
+    const SPACES: &str = "                                ";
+    let mut left = levels * 4;
+    while left > 0 {
+        let n = left.min(SPACES.len());
+        buf.write_str(&SPACES[..n])?;
+        left -= n;
+    }
+    Ok(())
 }
 
 impl fmt::Write for PadAdapter<'_, '_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for s in s.split_inclusive('\n') {
-            if self.state.on_newline {
-                self.buf.write_str("    ")?;
-            }
-
-            self.state.on_newline = s.ends_with('\n');
+            write_indentation(self.buf, self.levels.indentation())?;
+            self.levels.wrote(s.ends_with('\n'));
             self.buf.write_str(s)?;
         }
 
@@ -43,10 +149,8 @@ impl fmt::Write for PadAdapter<'_, '_> {
     }
 
     fn write_char(&mut self, c: char) -> fmt::Result {
-        if self.state.on_newline {
-            self.buf.write_str("    ")?;
-        }
-        self.state.on_newline = c == '\n';
+        write_indentation(self.buf, self.levels.indentation())?;
+        self.levels.wrote(c == '\n');
         self.buf.write_char(c)
     }
 }
@@ -159,13 +263,12 @@ impl<'a, 'b: 'a> DebugStruct<'a, 'b> {
                 if !self.has_fields {
                     self.fmt.write_str(" {\n")?;
                 }
-                let mut slot = None;
-                let mut state = Default::default();
-                let mut writer = PadAdapter::wrap(self.fmt, &mut slot, &mut state);
-                writer.write_str(name)?;
-                writer.write_str(": ")?;
-                value.fmt(&mut writer)?;
-                writer.write_str(",\n")
+                padded(self.fmt, &mut Default::default(), &mut |writer| {
+                    writer.write_str(name)?;
+                    writer.write_str(": ")?;
+                    value.fmt(writer)?;
+                    writer.write_str(",\n")
+                })
             } else {
                 let prefix = if self.has_fields { ", " } else { " { " };
                 self.fmt.write_str(prefix)?;
@@ -249,10 +352,9 @@ impl<'a, 'b: 'a> DebugStruct<'a, 'b> {
         self.result = self.result.and_then(|_| {
             if self.has_fields {
                 if self.is_pretty() {
-                    let mut slot = None;
-                    let mut state = Default::default();
-                    let mut writer = PadAdapter::wrap(self.fmt, &mut slot, &mut state);
-                    writer.write_str("..\n")?;
+                    padded(self.fmt, &mut Default::default(), &mut |writer| {
+                        writer.write_str("..\n")
+                    })?;
                     self.fmt.write_str("}")
                 } else {
                     self.fmt.write_str(", .. }")
@@ -383,11 +485,10 @@ impl<'a, 'b: 'a> DebugTuple<'a, 'b> {
                 if self.fields == 0 {
                     self.fmt.write_str("(\n")?;
                 }
-                let mut slot = None;
-                let mut state = Default::default();
-                let mut writer = PadAdapter::wrap(self.fmt, &mut slot, &mut state);
-                value.fmt(&mut writer)?;
-                writer.write_str(",\n")
+                padded(self.fmt, &mut Default::default(), &mut |writer| {
+                    value.fmt(writer)?;
+                    writer.write_str(",\n")
+                })
             } else {
                 let prefix = if self.fields == 0 { "(" } else { ", " };
                 self.fmt.write_str(prefix)?;
@@ -462,10 +563,9 @@ impl<'a, 'b: 'a> DebugTuple<'a, 'b> {
         self.result = self.result.and_then(|_| {
             if self.fields > 0 {
                 if self.is_pretty() {
-                    let mut slot = None;
-                    let mut state = Default::default();
-                    let mut writer = PadAdapter::wrap(self.fmt, &mut slot, &mut state);
-                    writer.write_str("..\n")?;
+                    padded(self.fmt, &mut Default::default(), &mut |writer| {
+                        writer.write_str("..\n")
+                    })?;
                     self.fmt.write_str(")")
                 } else {
                     self.fmt.write_str(", ..)")
@@ -533,11 +633,10 @@ impl<'a, 'b: 'a> DebugInner<'a, 'b> {
                 if !self.has_fields {
                     self.fmt.write_str("\n")?;
                 }
-                let mut slot = None;
-                let mut state = Default::default();
-                let mut writer = PadAdapter::wrap(self.fmt, &mut slot, &mut state);
-                entry.fmt(&mut writer)?;
-                writer.write_str(",\n")
+                padded(self.fmt, &mut Default::default(), &mut |writer| {
+                    entry.fmt(writer)?;
+                    writer.write_str(",\n")
+                })
             } else {
                 if self.has_fields {
                     self.fmt.write_str(", ")?
@@ -729,10 +828,9 @@ impl<'a, 'b: 'a> DebugSet<'a, 'b> {
         self.inner.result = self.inner.result.and_then(|_| {
             if self.inner.has_fields {
                 if self.inner.is_pretty() {
-                    let mut slot = None;
-                    let mut state = Default::default();
-                    let mut writer = PadAdapter::wrap(self.inner.fmt, &mut slot, &mut state);
-                    writer.write_str("..\n")?;
+                    padded(self.inner.fmt, &mut Default::default(), &mut |writer| {
+                        writer.write_str("..\n")
+                    })?;
                     self.inner.fmt.write_str("}")
                 } else {
                     self.inner.fmt.write_str(", ..}")
@@ -944,10 +1042,9 @@ impl<'a, 'b: 'a> DebugList<'a, 'b> {
         self.inner.result.and_then(|_| {
             if self.inner.has_fields {
                 if self.inner.is_pretty() {
-                    let mut slot = None;
-                    let mut state = Default::default();
-                    let mut writer = PadAdapter::wrap(self.inner.fmt, &mut slot, &mut state);
-                    writer.write_str("..\n")?;
+                    padded(self.inner.fmt, &mut Default::default(), &mut |writer| {
+                        writer.write_str("..\n")
+                    })?;
                     self.inner.fmt.write_str("]")
                 } else {
                     self.inner.fmt.write_str(", ..]")
@@ -1102,11 +1199,11 @@ impl<'a, 'b: 'a> DebugMap<'a, 'b> {
                 if !self.has_fields {
                     self.fmt.write_str("\n")?;
                 }
-                let mut slot = None;
                 self.state = Default::default();
-                let mut writer = PadAdapter::wrap(self.fmt, &mut slot, &mut self.state);
-                key.fmt(&mut writer)?;
-                writer.write_str(": ")?;
+                padded(self.fmt, &mut self.state, &mut |writer| {
+                    key.fmt(writer)?;
+                    writer.write_str(": ")
+                })?;
             } else {
                 if self.has_fields {
                     self.fmt.write_str(", ")?
@@ -1204,10 +1301,10 @@ impl<'a, 'b: 'a> DebugMap<'a, 'b> {
             assert!(self.has_key, "attempted to format a map value before its key");
 
             if self.is_pretty() {
-                let mut slot = None;
-                let mut writer = PadAdapter::wrap(self.fmt, &mut slot, &mut self.state);
-                value.fmt(&mut writer)?;
-                writer.write_str(",\n")?;
+                padded(self.fmt, &mut self.state, &mut |writer| {
+                    value.fmt(writer)?;
+                    writer.write_str(",\n")
+                })?;
             } else {
                 value.fmt(self.fmt)?;
             }
@@ -1340,10 +1437,9 @@ impl<'a, 'b: 'a> DebugMap<'a, 'b> {
 
             if self.has_fields {
                 if self.is_pretty() {
-                    let mut slot = None;
-                    let mut state = Default::default();
-                    let mut writer = PadAdapter::wrap(self.fmt, &mut slot, &mut state);
-                    writer.write_str("..\n")?;
+                    padded(self.fmt, &mut Default::default(), &mut |writer| {
+                        writer.write_str("..\n")
+                    })?;
                     self.fmt.write_str("}")
                 } else {
                     self.fmt.write_str(", ..}")
