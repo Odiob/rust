@@ -3,12 +3,6 @@
 use crate::cell::Cell;
 use crate::fmt::{self, Debug, Formatter};
 
-/// Indents what it writes by four spaces for each level of pretty-printed
-/// nesting it serves.
-///
-/// The outermost builder creates the adapter, and inner builders reach it
-/// through their formatter's `pad` instead of wrapping it again, so each byte
-/// passes through one adapter rather than one per level.
 struct PadAdapter<'buf, 'levels> {
     buf: &'buf mut (dyn fmt::Write + 'buf),
     levels: &'levels PadLevels,
@@ -24,12 +18,6 @@ impl Default for PadAdapterState {
     }
 }
 
-/// The `on_newline` flags of the levels of a [`PadAdapter`], as counts.
-///
-/// Writes come only from the innermost level, and each one sets every
-/// level's flag to whether it ended with a newline. So the levels up to
-/// `written` share the flag `tail`, and of the levels entered since the last
-/// write, `raised` were entered with their flag set.
 pub(super) struct PadLevels {
     depth: Cell<usize>,
     written: Cell<usize>,
@@ -52,8 +40,6 @@ impl PadLevels {
         self.raised.set(self.raised.get() + usize::from(on_newline));
     }
 
-    /// Leaves the innermost level, entered with flag `entered`, and returns
-    /// its flag now.
     fn leave(&self, entered: bool) -> bool {
         let depth = self.depth.get();
         let written = self.written.get();
@@ -68,8 +54,6 @@ impl PadLevels {
         flag
     }
 
-    /// The number of levels whose flag is set: what the next piece is
-    /// indented by.
     fn indentation(&self) -> usize {
         let written = if self.tail.get() { self.written.get() } else { 0 };
         written + self.raised.get()
@@ -82,8 +66,6 @@ impl PadLevels {
     }
 }
 
-/// A level of a [`PadAdapter`], left on drop so that a `Debug` impl that
-/// unwinds leaves the levels as it found them.
 struct PadLevel<'a> {
     levels: &'a PadLevels,
     state: &'a mut PadAdapterState,
@@ -104,8 +86,6 @@ impl Drop for PadLevel<'_> {
     }
 }
 
-/// Runs `body` with a formatter that indents by one level more than `fmt`;
-/// `state` keeps that level's flag between calls.
 fn padded(
     fmt: &mut fmt::Formatter<'_>,
     state: &mut PadAdapterState,

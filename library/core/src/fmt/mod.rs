@@ -563,8 +563,6 @@ pub struct Formatter<'a> {
 
     buf: &'a mut (dyn Write + 'a),
 
-    // The padding levels of pretty `Debug` output that `buf` already applies,
-    // when `buf` is the debug builders' padding adapter.
     pad: Option<&'a builders::PadLevels>,
 }
 
@@ -1632,13 +1630,10 @@ pub trait UpperExp: PointeeSized {
 ///
 /// [`write!`]: crate::write!
 #[stable(feature = "rust1", since = "1.0.0")]
-#[inline]
 pub fn write(output: &mut dyn Write, fmt: Arguments<'_>) -> Result {
     write_padded(output, None, fmt)
 }
 
-/// [`write`] into an `output` that already applies the padding levels `pad`
-/// of pretty `Debug` output, so that the formatters it makes share them.
 fn write_padded(
     output: &mut dyn Write,
     pad: Option<&builders::PadLevels>,

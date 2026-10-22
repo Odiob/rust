@@ -1061,7 +1061,6 @@ Foo {
 mod pretty_padding {
     use std::fmt::{self, Formatter, Write};
 
-    /// Writes its text with `write_str`.
     struct Raw(&'static str);
 
     impl fmt::Debug for Raw {
@@ -1070,7 +1069,6 @@ mod pretty_padding {
         }
     }
 
-    /// Writes its text with one `write_char` per character.
     struct Chars(&'static str);
 
     impl fmt::Debug for Chars {
@@ -1079,7 +1077,6 @@ mod pretty_padding {
         }
     }
 
-    /// `N { i: .. }` nested `self.0` levels deep around `x`.
     struct Nest(usize);
 
     impl fmt::Debug for Nest {
@@ -1091,7 +1088,6 @@ mod pretty_padding {
         }
     }
 
-    /// The pretty output of `Nest(depth)`.
     fn nest_pretty(depth: usize) -> String {
         if depth == 0 {
             return "x".to_string();
